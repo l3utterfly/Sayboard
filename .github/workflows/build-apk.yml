@@ -7,10 +7,6 @@ on:
 permissions:
   contents: write
 
-concurrency:
-  group: build-apk-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   build:
     name: Build debug APK
@@ -42,17 +38,21 @@ jobs:
           retention-days: 14
 
       - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
+        if: github.ref == 'refs/heads/master'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          if gh release view "${{ github.ref_name }}" > /dev/null 2>&1; then
-            gh release upload "${{ github.ref_name }}" \
+          release_tag="master-build-${{ github.run_number }}"
+
+          if gh release view "$release_tag" > /dev/null 2>&1; then
+            gh release upload "$release_tag" \
               app/build/outputs/apk/debug/Sayboard_Universal.apk \
               --clobber
           else
-            gh release create "${{ github.ref_name }}" \
+            gh release create "$release_tag" \
               app/build/outputs/apk/debug/Sayboard_Universal.apk \
-              --generate-notes \
-              --title "${{ github.ref_name }}"
+              --target "${{ github.sha }}" \
+              --title "Master build #${{ github.run_number }}" \
+              --notes "Automated APK build from commit ${{ github.sha }}." \
+              --latest
           fi
