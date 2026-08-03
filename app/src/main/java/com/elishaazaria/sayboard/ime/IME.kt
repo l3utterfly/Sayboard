@@ -371,6 +371,7 @@ class IME : InputMethodService(), ModelManager.Listener {
             when (type) {
                 ModelManager.ErrorType.MIC_IN_USE -> R.string.mic_error_mic_in_use
                 ModelManager.ErrorType.NO_RECOGNIZERS_INSTALLED -> R.string.mic_error_no_recognizers
+                ModelManager.ErrorType.INVALID_AUDIO_SOURCE -> R.string.mic_error_recognizer_error
             }
         )
     }

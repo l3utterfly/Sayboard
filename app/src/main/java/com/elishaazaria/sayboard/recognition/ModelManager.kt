@@ -39,6 +39,8 @@ class ModelManager(
     private var recognizerSources: MutableList<RecognizerSource> = ArrayList()
     private var currentRecognizerSourceIndex = 0
     private var currentRecognizerSource: RecognizerSource? = null
+    private var pendingInjectedAudioSource: InjectedAudioSource? = null
+    private var initializationGeneration = 0
     private val executor: Executor = Executors.newSingleThreadExecutor()
 
 
@@ -46,16 +48,48 @@ class ModelManager(
         reloadModels()
     }
 
-    private fun initializeRecognizer(autoStart: Boolean, attributionContext: Context? = null) {
+    private fun initializeRecognizer(
+        autoStart: Boolean,
+        attributionContext: Context? = null,
+        injectedAudioSource: InjectedAudioSource? = null
+    ) {
         if (recognizerSources.size == 0) {
+            Log.e(TAG, "ModelManager initialize: no recognizer sources")
+            injectedAudioSource?.closeQuietly()
             return
         }
+
+        initializationGeneration++
+        val generation = initializationGeneration
+        pendingInjectedAudioSource?.closeQuietly()
+        pendingInjectedAudioSource = injectedAudioSource
         currentRecognizerSource = recognizerSources[currentRecognizerSourceIndex]
+        Log.d(
+            TAG,
+            "ModelManager initialize: index=$currentRecognizerSourceIndex, " +
+                    "name=${currentRecognizerSource!!.name}, " +
+                    "locale=${currentRecognizerSource!!.locale.toLanguageTag()}, autoStart=$autoStart, " +
+                    "hasAttributionContext=${attributionContext != null}, " +
+                    "inputMode=${if (injectedAudioSource == null) "microphone" else "injected"}"
+        )
         listener.onRecognizerSource(currentRecognizerSource!!)
 
         val onLoaded = Observer { r: RecognizerSource? ->
+            if (generation != initializationGeneration) {
+                Log.d(TAG, "ModelManager loaded: ignoring stale initialization generation=$generation")
+                return@Observer
+            }
+            Log.d(
+                TAG,
+                "ModelManager loaded: name=${r?.name}, locale=${r?.locale?.toLanguageTag()}, " +
+                        "closed=${r?.closed}, autoStart=$autoStart"
+            )
+            val pendingAudioSource = pendingInjectedAudioSource
+            pendingInjectedAudioSource = null
             if (autoStart) {
-                start(attributionContext) // execute after initialize
+                start(attributionContext, pendingAudioSource) // execute after initialize
+            } else {
+                pendingAudioSource?.closeQuietly()
             }
         }
         currentRecognizerSource!!.initialize(executor, onLoaded)
@@ -64,21 +98,36 @@ class ModelManager(
     val currentRecognizerSourceAddSpaces: Boolean
         get() = currentRecognizerSource?.addSpaces ?: true
 
-    fun switchToNextRecognizer(autoStart: Boolean, attributionContext: Context? = null) {
-        if (recognizerSources.size == 0 || recognizerSources.size == 1) return
+    fun switchToNextRecognizer(
+        autoStart: Boolean,
+        attributionContext: Context? = null,
+        injectedAudioSource: InjectedAudioSource? = null
+    ) {
+        if (recognizerSources.size == 0 || recognizerSources.size == 1) {
+            injectedAudioSource?.closeQuietly()
+            return
+        }
         stop(true)
         currentRecognizerSourceIndex++
         if (currentRecognizerSourceIndex >= recognizerSources.size) {
             currentRecognizerSourceIndex = 0
         }
-        initializeRecognizer(autoStart, attributionContext) // start is called after the recognizer is initialized
+        initializeRecognizer(autoStart, attributionContext, injectedAudioSource)
     }
 
     fun switchToRecognizerOfLocale(
         locale: Locale,
         autoStart: Boolean,
-        attributionContext: Context? = null
+        attributionContext: Context? = null,
+        injectedAudioSource: InjectedAudioSource? = null
     ): Boolean {
+        Log.d(
+            TAG,
+            "ModelManager select locale=${locale.toLanguageTag()} from " +
+                    recognizerSources.joinToString(prefix = "[", postfix = "]") {
+                        "${it.name}:${it.locale.toLanguageTag()}"
+                    }
+        )
         var bestSource = -1
         var foundLanguage = false
         var foundCountry = false
@@ -110,38 +159,55 @@ class ModelManager(
         }
 
         if (bestSource == -1) {
+            Log.w(TAG, "ModelManager select: no model matched locale=${locale.toLanguageTag()}")
             return false
         }
 
         stop(true)
         currentRecognizerSourceIndex = bestSource
+        Log.d(
+            TAG,
+            "ModelManager select: chose index=$bestSource, " +
+                    "name=${recognizerSources[bestSource].name}, " +
+                    "locale=${recognizerSources[bestSource].locale.toLanguageTag()}"
+        )
 
         initializeRecognizer(
             autoStart,
-            attributionContext
+            attributionContext,
+            injectedAudioSource
         ) // start is called after the recognizer is initialized
 
         return true
     }
 
-    fun initializeFirstLocale(autoStart: Boolean, attributionContext: Context? = null): Boolean {
+    fun initializeFirstLocale(
+        autoStart: Boolean,
+        attributionContext: Context? = null,
+        injectedAudioSource: InjectedAudioSource? = null
+    ): Boolean {
         if (recognizerSources.size == 0) {
+            injectedAudioSource?.closeQuietly()
             listener.onError(ErrorType.NO_RECOGNIZERS_INSTALLED)
             listener.onStateChanged(State.STATE_ERROR)
             return false
         }
 
         currentRecognizerSourceIndex = 0
-        initializeRecognizer(autoStart, attributionContext)
+        initializeRecognizer(autoStart, attributionContext, injectedAudioSource)
         return true
     }
 
-    fun start(attributionContext: Context? = null) {
+    fun start(
+        attributionContext: Context? = null,
+        injectedAudioSource: InjectedAudioSource? = null
+    ) {
         if (currentRecognizerSource == null) {
             Log.w(
                 TAG,
                 "currentRecognizerSource is null!"
             )
+            injectedAudioSource?.closeQuietly()
             return
         }
         if (currentRecognizerSource!!.closed) {
@@ -149,27 +215,50 @@ class ModelManager(
                 TAG,
                 "Trying to start a closed Recognizer Source: ${currentRecognizerSource!!.name}"
             )
+            injectedAudioSource?.closeQuietly()
             return
         }
         if (isRunning || speechService != null) {
-            speechService!!.stop()
+            speechService?.stop()
         }
         isRunning = true
         listener.onStateChanged(State.STATE_LISTENING)
         try {
             val recognizer = currentRecognizerSource!!.recognizer
-            if (ActivityCompat.checkSelfPermission(
+            val hasRecordAudioPermission = ActivityCompat.checkSelfPermission(
                     context,
                     Manifest.permission.RECORD_AUDIO
-                ) != PackageManager.PERMISSION_GRANTED
-            ) {
+                ) == PackageManager.PERMISSION_GRANTED
+            Log.d(
+                TAG,
+                "ModelManager start: source=${currentRecognizerSource!!.name}, " +
+                        "locale=${currentRecognizerSource!!.locale.toLanguageTag()}, " +
+                        "sampleRate=${recognizer.sampleRate}, hasRecordAudioPermission=$hasRecordAudioPermission, " +
+                        "hasAttributionContext=${attributionContext != null}, recordDevice=${recordDevice?.productName}, " +
+                        "inputMode=${if (injectedAudioSource == null) "microphone" else "injected"}"
+            )
+            if (injectedAudioSource == null && !hasRecordAudioPermission) {
+                Log.e(TAG, "ModelManager start aborted: Sayboard RECORD_AUDIO permission is not granted")
                 return
             }
-            speechService = MySpeechService(recognizer, recognizer.sampleRate, attributionContext)
+            speechService = MySpeechService(
+                recognizer,
+                recognizer.sampleRate,
+                attributionContext,
+                injectedAudioSource
+            )
             speechService!!.recordDevice = recordDevice
-            speechService!!.startListening(listener)
+            val started = speechService!!.startListening(listener)
+            Log.d(TAG, "ModelManager start: MySpeechService.startListening returned $started")
         } catch (e: IOException) {
+            injectedAudioSource?.closeQuietly()
+            Log.e(TAG, "ModelManager start: failed to initialize or start AudioRecord", e)
             listener.onError(ErrorType.MIC_IN_USE)
+            listener.onStateChanged(State.STATE_ERROR)
+        } catch (e: IllegalArgumentException) {
+            injectedAudioSource?.closeQuietly()
+            Log.e(TAG, "ModelManager start: invalid injected audio source", e)
+            listener.onError(ErrorType.INVALID_AUDIO_SOURCE)
             listener.onStateChanged(State.STATE_ERROR)
         }
     }
@@ -190,8 +279,10 @@ class ModelManager(
 //        }
 
         val newModels = prefs.modelsOrder.get()
-        if (newModels == recognizerSourceModels)
+        if (newModels == recognizerSourceModels) {
+            Log.d(TAG, "ModelManager reload: model order unchanged (${newModels.size} models)")
             return
+        }
 
         recognizerSources.clear()
         recognizerSourceModels = newModels
@@ -200,6 +291,15 @@ class ModelManager(
                 recognizerSources.add(it)
             }
         }
+
+        Log.d(
+            TAG,
+            "ModelManager reload: references=${recognizerSourceModels.size}, " +
+                    "usableSources=${recognizerSources.size}, sources=" +
+                    recognizerSources.joinToString(prefix = "[", postfix = "]") {
+                        "${it.name}:${it.locale.toLanguageTag()}"
+                    }
+        )
 
         if (recognizerSources.size == 0) {
             listener.onError(ErrorType.NO_RECOGNIZERS_INSTALLED)
@@ -225,6 +325,14 @@ class ModelManager(
         get() = pausedState && speechService != null
 
     fun stop(forceFreeRam: Boolean = false) {
+        Log.d(
+            TAG,
+            "ModelManager stop: forceFreeRam=$forceFreeRam, isRunning=$isRunning, " +
+                    "hasSpeechService=${speechService != null}"
+        )
+        initializationGeneration++
+        pendingInjectedAudioSource?.closeQuietly()
+        pendingInjectedAudioSource = null
         speechService?.let {
             executor.execute {
                 it.stop()
@@ -256,7 +364,15 @@ class ModelManager(
         }
 
     companion object {
-        private const val TAG = "ModelManager"
+        private const val TAG = "SayboardRecognition"
+    }
+
+    private fun InjectedAudioSource.closeQuietly() {
+        try {
+            close()
+        } catch (e: IOException) {
+            Log.w(TAG, "ModelManager: failed to close injected audio descriptor", e)
+        }
     }
 
     interface Listener : RecognitionListener {
@@ -272,6 +388,6 @@ class ModelManager(
     }
 
     enum class ErrorType {
-        MIC_IN_USE, NO_RECOGNIZERS_INSTALLED
+        MIC_IN_USE, NO_RECOGNIZERS_INSTALLED, INVALID_AUDIO_SOURCE
     }
 }
